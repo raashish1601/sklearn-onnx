@@ -1043,7 +1043,9 @@ def make_calc_impute_donors(g: ModelComponentContainer, scope: Scope, itype: int
     return gr
 
 
-def make_calc_impute_weights(g: ModelComponentContainer, scope: Scope, itype: int):
+def make_calc_impute_weights(
+    g: ModelComponentContainer, scope: Scope, itype: int, weights: str = "uniform"
+):
     gr = ModelComponentContainer({"": g.main_opset}, as_function=True)
     donors_dist = gr.make_tensor_input("donors_dist")
     op = gr.get_op_builder(scope)
@@ -1053,16 +1055,34 @@ def make_calc_impute_weights(g: ModelComponentContainer, scope: Scope, itype: in
         ),
         outputs=["c_lifted_tensor_0"],
     )
-    _shape_donors_dist0 = op.Shape(donors_dist, outputs=["_shape_donors_dist0"])
-    ones_like = op.ConstantOfShape(
-        _shape_donors_dist0,
-        value=from_array(
-            np.array([1.0], dtype=tensor_dtype_to_np_dtype(itype)), name="value"
-        ),
-        outputs=["ones_like"],
-    )
-    isnan = op.IsNaN(donors_dist, outputs=["isnan"])
-    output_0 = op.Where(isnan, c_lifted_tensor_0, ones_like, outputs=["output_0"])
+    if weights == "distance":
+        # same as sklearn.neighbors._base._get_weights: the inverse of the
+        # distance, and if a row has donors at distance 0, only these count
+        inverse = op.Reciprocal(donors_dist, outputs=["inverse"])
+        isinf = op.IsInf(inverse, outputs=["isinf"])
+        isinf_float = op.Cast(isinf, to=itype, outputs=["isinf_float"])
+        axis = op.Constant(
+            value=from_array(np.array([1], dtype=np.int64), name="value"),
+            outputs=["axis"],
+        )
+        inf_row = op.ReduceMaxAnyOpset(
+            isinf_float, axis, keepdims=1, outputs=["inf_row"]
+        )
+        has_inf = op.Greater(inf_row, c_lifted_tensor_0, outputs=["has_inf"])
+        weight = op.Where(has_inf, isinf_float, inverse, outputs=["weight"])
+        isnan = op.IsNaN(weight, outputs=["isnan"])
+        output_0 = op.Where(isnan, c_lifted_tensor_0, weight, outputs=["output_0"])
+    else:
+        _shape_donors_dist0 = op.Shape(donors_dist, outputs=["_shape_donors_dist0"])
+        ones_like = op.ConstantOfShape(
+            _shape_donors_dist0,
+            value=from_array(
+                np.array([1.0], dtype=tensor_dtype_to_np_dtype(itype)), name="value"
+            ),
+            outputs=["ones_like"],
+        )
+        isnan = op.IsNaN(donors_dist, outputs=["isnan"])
+        output_0 = op.Where(isnan, c_lifted_tensor_0, ones_like, outputs=["output_0"])
     gr.make_tensor_output(output_0)
     g.make_local_function(
         container=gr, optimize=False, name="calc_impute_weights", domain="local_domain"
@@ -1667,12 +1687,6 @@ def convert_knn_imputer(
             f"Unable to convert KNNImputer when weights "
             f"is callable, knn_op.weights={knn_op.weights}"
         )
-    if knn_op.weights == "distance":
-        raise NotImplementedError(
-            "KNNImputer with distance as metric is not supported, "
-            "you may raise an issue at "
-            "https://github.com/onnx/sklearn-onnx/issues."
-        )
     # options = container.get_options(knn_op, dict(optim=None))
     # options are not used anymore
     training_data = knn_op._fit_X.astype(dtype)
@@ -1688,7 +1702,9 @@ def convert_knn_imputer(
     make_dict_idx_map(container, Scope("LF1"), itype=proto_type)
     make_dist_nan_euclidean(container, Scope("LF2"), itype=proto_type)
     make_calc_impute_donors(container, Scope("LF3"), itype=proto_type)
-    make_calc_impute_weights(container, Scope("LF4"), itype=proto_type)
+    make_calc_impute_weights(
+        container, Scope("LF4"), itype=proto_type, weights=knn_op.weights
+    )
     make_calc_impute_make_new_neights(container, Scope("LF5"), itype=proto_type)
     make_calc_impute(container, Scope("LF6"), itype=proto_type)
     make_knn_imputer_column_all_nan(container, Scope("LF7"), itype=proto_type)
